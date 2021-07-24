@@ -139,21 +139,34 @@ class PyInstArchive:
     def checkFile(self):
         print('[+] Processing {0}'.format(self.filePath))
         # Check if it is a 2.0 archive
-        self.fPtr.seek(self.fileSize - self.PYINST20_COOKIE_SIZE, os.SEEK_SET)
+        self.carchive_offset = 0
+        offset = self.fileSize - self.PYINST20_COOKIE_SIZE
+        self.fPtr.seek(offset, os.SEEK_SET)
         magicFromFile = self.fPtr.read(len(self.MAGIC))
-
         if magicFromFile == self.MAGIC:
             self.pyinstVer = 20     # pyinstaller 2.0
+            self.carchive_offset = offset
             print('[+] Pyinstaller version: 2.0')
             return True
 
         # Check for pyinstaller 2.1+ before bailing out
-        self.fPtr.seek(self.fileSize - self.PYINST21_COOKIE_SIZE, os.SEEK_SET)
+        offset = self.fileSize - self.PYINST21_COOKIE_SIZE
+        self.fPtr.seek(offset, os.SEEK_SET)
         magicFromFile = self.fPtr.read(len(self.MAGIC))
-
         if magicFromFile == self.MAGIC:
             print('[+] Pyinstaller version: 2.1+')
             self.pyinstVer = 21     # pyinstaller 2.1+
+            self.carchive_offset = offset
+            return True
+
+        # some trail in file (MacOS binary)
+        self.fPtr.seek(0, os.SEEK_SET)
+        self.data = self.fPtr.read()
+        magic_position = self.data.rfind(self.MAGIC)
+        if magic_position != -1:
+            print('[?] Pyinstaller version: unknown')
+            self.pyinstVer = 20
+            self.carchive_offset = magic_position
             return True
 
         print('[!] Error : Unsupported pyinstaller version or not a pyinstaller archive')
@@ -162,20 +175,10 @@ class PyInstArchive:
 
     def getCArchiveInfo(self):
         try:
-            if self.pyinstVer == 20:
-                self.fPtr.seek(self.fileSize - self.PYINST20_COOKIE_SIZE, os.SEEK_SET)
-
-                # Read CArchive cookie
-                (magic, lengthofPackage, toc, tocLen, self.pyver) = \
+            self.fPtr.seek(self.carchive_offset, os.SEEK_SET)
+            magic, lengthofPackage, toc, tocLen, self.pyver = (
                 struct.unpack('!8siiii', self.fPtr.read(self.PYINST20_COOKIE_SIZE))
-
-            elif self.pyinstVer == 21:
-                self.fPtr.seek(self.fileSize - self.PYINST21_COOKIE_SIZE, os.SEEK_SET)
-
-                # Read CArchive cookie
-                (magic, lengthofPackage, toc, tocLen, self.pyver, pylibname) = \
-                struct.unpack('!8siiii64s', self.fPtr.read(self.PYINST21_COOKIE_SIZE))
-
+            )
         except:
             print('[!] Error : The file is not a pyinstaller archive')
             return False
@@ -193,7 +196,23 @@ class PyInstArchive:
 
 
     def parseTOC(self):
+        self.global_offset = 0
+
         # Go to the table of contents
+        self.fPtr.seek(self.tableOfContentsPos, os.SEEK_SET)
+
+        # test toc
+        TOC_START = b'\x00\x00\x00\x20\x00\x00\x00\x00'
+        actual_toc_start = self.fPtr.read(8)
+        if actual_toc_start != TOC_START:
+            print('[?] TOC not found at specific offset')
+            actual_toc_pos = self.data.rfind(TOC_START)
+            if actual_toc_pos != -1:
+                self.global_offset = actual_toc_pos - self.tableOfContentsPos
+                self.tableOfContentsPos = actual_toc_pos
+                print('[+] Heuristics found something like TOC, missed by ' + str(self.global_offset))
+            else:
+                print('[!] Error : TOC not found')
         self.fPtr.seek(self.tableOfContentsPos, os.SEEK_SET)
 
         self.tocList = []
@@ -214,15 +233,16 @@ class PyInstArchive:
                 name = str(uniquename())
                 print('[!] Warning: Found an unamed file in CArchive. Using random name {0}'.format(name))
 
-            self.tocList.append( \
-                                CTOCEntry(                      \
-                                    self.overlayPos + entryPos, \
-                                    cmprsdDataSize,             \
-                                    uncmprsdDataSize,           \
-                                    cmprsFlag,                  \
-                                    typeCmprsData,              \
-                                    name                        \
-                                ))
+            self.tocList.append(
+                CTOCEntry(
+                    self.global_offset + self.overlayPos + entryPos,
+                    cmprsdDataSize,
+                    uncmprsdDataSize,
+                    cmprsFlag,
+                    typeCmprsData,
+                    name,
+                )
+            )
 
             parsedLen += entrySize
         print('[+] Found {0} files in CArchive'.format(len(self.tocList)))
